@@ -1,6 +1,8 @@
 """Authentication endpoints: login, refresh, logout, user preferences."""
 
+import hashlib
 import logging
+import re
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -8,26 +10,187 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.deps import AuthUser, DBSession, get_current_user
 
 __all__ = ["router", "get_current_user"]
 from app.core.config import settings
 from app.core.role_grants import wildcard_roles as WILDCARD_ROLES
+from app.db.rls import set_rls_context
 from app.core.security import (
     create_access_token,
     create_refresh_token,
     decode_token,
+    get_password_hash,
     token_is_revoked,
     verify_password,
 )
-from app.models.tenant import User
+from app.models.tenant import Tenant, User
+from app.models.tenant_admin_invitation import TenantAdminInvitation
 from app.services.login_throttle import client_ip, get_login_throttle
+from app.services.waitlist import get_signup_rate_limiter
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+_INVITE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+_TENANT_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{1,58}[a-z0-9])?$")
+_INITIAL_ADMIN_SENTINEL = "!invite-pending"
+_INVITATION_ERROR = "This invitation is invalid, expired, or already used."
+
+
+async def _apply_invitation_rate_limit(request: Request) -> None:
+    source = client_ip(request)
+    decision = await get_signup_rate_limiter().acquire(f"admin-invitation:{source}")
+    if not decision.allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many invitation attempts. Try again later.",
+            headers=decision.to_headers(),
+        )
+
+
+async def _invitation_target(
+    db: AsyncSession,
+    *,
+    token: object,
+    tenant_slug: object,
+) -> tuple[TenantAdminInvitation, User] | None:
+    """Resolve only a live invite and its still-pending, fixed admin user."""
+    if not isinstance(token, str) or not _INVITE_TOKEN_RE.fullmatch(token):
+        return None
+    if not isinstance(tenant_slug, str) or not _TENANT_SLUG_RE.fullmatch(tenant_slug):
+        return None
+
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    invitation = (
+        await db.execute(
+            select(TenantAdminInvitation).where(
+                TenantAdminInvitation.token_hash == token_hash,
+                TenantAdminInvitation.expires_at > func.now(),
+                TenantAdminInvitation.consumed_at.is_(None),
+                TenantAdminInvitation.revoked_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if invitation is None:
+        return None
+
+    tenant = (
+        await db.execute(
+            select(Tenant).where(
+                Tenant.id == invitation.tenant_id,
+                Tenant.slug == tenant_slug,
+                Tenant.is_active.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if tenant is None:
+        return None
+
+    user = (
+        await db.execute(
+            select(User).where(
+                User.id == invitation.user_id,
+                User.tenant_id == invitation.tenant_id,
+                User.role == "tenant_admin",
+                User.is_active.is_(False),
+                User.is_verified.is_(False),
+                User.hashed_password == _INITIAL_ADMIN_SENTINEL,
+            )
+        )
+    ).scalar_one_or_none()
+    if user is None:
+        return None
+    await set_rls_context(db, invitation.tenant_id)
+    return invitation, user
+
+
+@router.post("/invitations/validate", response_model=dict[str, bool])
+async def validate_admin_invitation(request: Request, db: DBSession) -> dict[str, bool]:
+    """Validate a bearer invite without disclosing the invited account."""
+    await _apply_invitation_rate_limit(request)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — malformed body gets the same generic reply
+        body = None
+    if not isinstance(body, dict):
+        return {"valid": False}
+    target = await _invitation_target(db, token=body.get("token"), tenant_slug=body.get("tenant"))
+    return {"valid": target is not None}
+
+
+@router.post("/invitations/redeem", response_model=dict[str, bool])
+async def redeem_admin_invitation(request: Request, db: DBSession) -> dict[str, bool]:
+    """Atomically consume an invite and activate only its bound initial admin."""
+    await _apply_invitation_rate_limit(request)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — do not echo malformed request data
+        body = None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_INVITATION_ERROR)
+
+    token = body.get("token")
+    tenant_slug = body.get("tenant")
+    password = body.get("password")
+    if not isinstance(password, str) or len(password) < 12 or len(password.encode("utf-8")) > 72:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must be at least 12 characters and no more than 72 UTF-8 bytes.",
+        )
+
+    target = await _invitation_target(db, token=token, tenant_slug=tenant_slug)
+    if target is None or not isinstance(token, str):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_INVITATION_ERROR)
+    invitation, user = target
+
+    # Claim the invite with a conditional UPDATE. PostgreSQL serializes
+    # competing redemptions on this row, so exactly one request can proceed.
+    now = datetime.now(UTC)
+    claimed = await db.execute(
+        update(TenantAdminInvitation)
+        .where(
+            TenantAdminInvitation.id == invitation.id,
+            TenantAdminInvitation.tenant_id == user.tenant_id,
+            TenantAdminInvitation.user_id == user.id,
+            TenantAdminInvitation.token_hash == hashlib.sha256(token.encode("utf-8")).hexdigest(),
+            TenantAdminInvitation.expires_at > func.now(),
+            TenantAdminInvitation.consumed_at.is_(None),
+            TenantAdminInvitation.revoked_at.is_(None),
+        )
+        .values(consumed_at=now)
+        .returning(TenantAdminInvitation.id)
+    )
+    if claimed.scalar_one_or_none() is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_INVITATION_ERROR)
+
+    activated = await db.execute(
+        update(User)
+        .where(
+            User.id == user.id,
+            User.tenant_id == invitation.tenant_id,
+            User.role == "tenant_admin",
+            User.is_active.is_(False),
+            User.is_verified.is_(False),
+            User.hashed_password == _INITIAL_ADMIN_SENTINEL,
+        )
+        .values(
+            hashed_password=get_password_hash(password),
+            is_active=True,
+            is_verified=True,
+            sessions_revoked_at=now,
+            updated_at=now,
+        )
+        .returning(User.id)
+    )
+    if activated.scalar_one_or_none() is None:
+        # Raising makes get_db roll back both the token claim and user update.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_INVITATION_ERROR)
+    return {"ok": True}
 
 
 class LoginRequest(BaseModel):

@@ -52,6 +52,7 @@ from app.models.saved_hunt import SavedHunt
 from app.models.saved_view import SavedView
 from app.models.scim import ScimGroup, ScimGroupMember, ScimToken, ScimUser
 from app.models.tenant import ApiKey, Tenant, User
+from app.models.tenant_admin_invitation import TenantAdminInvitation
 from app.models.threat_intel import ThreatActor, ThreatIntelFeed, ThreatIntelIOC
 
 __all__ = [
@@ -59,6 +60,7 @@ __all__ = [
     "Tenant",
     "User",
     "ApiKey",
+    "TenantAdminInvitation",
     "Alert",
     "AlertAssetCorrelation",
     "AlertIdentityLink",

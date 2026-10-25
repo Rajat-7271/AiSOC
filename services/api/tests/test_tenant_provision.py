@@ -20,6 +20,7 @@ fields the endpoint actually queries on, and never touch Postgres.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -29,6 +30,7 @@ import pytest
 from app.api.v1.endpoints import tenant_provision as endpoint
 from app.core.config import console_base_url
 from app.models.tenant import Tenant, User
+from app.models.tenant_admin_invitation import TenantAdminInvitation
 from app.models.waitlist import (
     WAITLIST_STATUS_DECLINED,
     WAITLIST_STATUS_NEW,
@@ -100,12 +102,25 @@ class _MockSession:
         self.waitlist: dict[uuid.UUID, WaitlistEntry] = {}
         self.tenants: dict[uuid.UUID, Tenant] = {}
         self.users: dict[uuid.UUID, User] = {}
+        self.invitations: dict[uuid.UUID, TenantAdminInvitation] = {}
         self.commit_calls: int = 0
         self.rollback_calls: int = 0
         self.flush_calls: int = 0
 
     async def execute(self, stmt: Any, params: Any = None) -> Any:
         sql = str(stmt).lower()
+        if "set_config('app.current_tenant_id'" in sql:
+            return _MockExecuteResult([])
+        if "update tenant_admin_invitations" in sql:
+            compiled = stmt.compile(compile_kwargs={"literal_binds": False})
+            values = dict(compiled.params)
+            tenant_id = next((v for k, v in values.items() if "tenant_id" in k and isinstance(v, uuid.UUID)), None)
+            user_id = next((v for k, v in values.items() if "user_id" in k and isinstance(v, uuid.UUID)), None)
+            revoked_at = next((v for k, v in values.items() if "revoked_at" in k and isinstance(v, datetime)), None)
+            for invitation in self.invitations.values():
+                if invitation.tenant_id == tenant_id and invitation.user_id == user_id and invitation.consumed_at is None:
+                    invitation.revoked_at = revoked_at
+            return _MockExecuteResult([])
         # Raw ``text(...)`` statements (UPDATE tenants ... in the
         # provisioner) carry their bindings via the ``params`` arg
         # and do not expose ``.compile``. We swallow them — the
@@ -168,6 +183,13 @@ class _MockSession:
             if row.created_at is None:
                 row.created_at = datetime.now(UTC)
             self.users[row.id] = row
+            return
+        if isinstance(row, TenantAdminInvitation):
+            if row.id is None:
+                row.id = uuid.uuid4()
+            if row.created_at is None:
+                row.created_at = datetime.now(UTC)
+            self.invitations[row.id] = row
             return
         if isinstance(row, WaitlistEntry):
             if row.id is None:
@@ -357,6 +379,14 @@ class TestProvisionFromWaitlist:
         assert result.aisoc_credential_key_fingerprint
         # Tenant row landed.
         assert any(t.slug == "acme-inc" for t in session.tenants.values())
+        tenant = next(t for t in session.tenants.values() if t.slug == "acme-inc")
+        assert tenant.mssp_role == "standalone"
+        invitation = next(iter(session.invitations.values()))
+        assert invitation.tenant_id == tenant.id
+        assert invitation.user_id == result.admin_user.id
+        assert invitation.expires_at > datetime.now(UTC)
+        assert invitation.token_hash != result.admin_invite.token
+        assert invitation.token_hash == hashlib.sha256(result.admin_invite.token.encode()).hexdigest()
         # Admin user row landed (inactive, pending invite).
         admin = next(iter(session.users.values()))
         assert admin.is_active is False
@@ -495,7 +525,7 @@ class TestProvisionFromWaitlist:
             tenant_id=existing_tenant.id,
             email="founder@acme.io",
             username="founder",
-            hashed_password="hash",
+            hashed_password="!invite-pending",
             role="tenant_admin",
             is_active=False,
             is_verified=False,
@@ -527,6 +557,24 @@ class TestProvisionFromWaitlist:
         # Admin invite is still issued so the operator can re-send it.
         assert isinstance(result.admin_invite, AdminInvite)
         assert result.aisoc_credential_key_fingerprint == "abcdef12"
+        invitation = next(iter(session.invitations.values()))
+        assert invitation.tenant_id == existing_tenant.id
+        assert invitation.user_id == existing_admin.id
+        first_raw_token = result.admin_invite.token
+        second_result = _run(
+            provision_from_waitlist(
+                session,  # type: ignore[arg-type]
+                waitlist_entry_id=entry.id,
+                actor_email="ops@example.com",
+                seed_demo=False,
+            )
+        )
+        assert second_result.tenant_id == existing_tenant.id
+        assert second_result.admin_invite.token != first_raw_token
+        assert invitation.revoked_at is not None
+        current = [row for row in session.invitations.values() if row.revoked_at is None and row.consumed_at is None]
+        assert len(current) == 1
+        assert current[0].token_hash == hashlib.sha256(second_result.admin_invite.token.encode()).hexdigest()
 
     def test_demo_seeder_called_when_enabled(self) -> None:
         session = _MockSession()

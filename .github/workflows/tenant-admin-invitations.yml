@@ -1,0 +1,126 @@
+# Initial-admin invitation persistence and PostgreSQL single-use behavior.
+# Each Actions job gets a new PostgreSQL service and an empty dedicated DB;
+# the full migration chain runs there before either unit or integration tests.
+name: Tenant admin invitations
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  invitation-tests:
+    name: Invitation lifecycle (locked API deps + disposable PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: public.ecr.aws/docker/library/postgres:16-alpine
+        env:
+          POSTGRES_USER: aisoc
+          POSTGRES_PASSWORD: ${{ format('ci-owner-{0}-{1}', github.run_id, github.run_attempt) }}
+          POSTGRES_DB: aisoc_invitation_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aisoc -d aisoc_invitation_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # Both credentials are unique to this disposable PostgreSQL container.
+      # The owner URL is used only by the migration runner; tests use the
+      # DML-only role created and granted by the normal migration chain.
+      DATABASE_URL: postgresql+asyncpg://aisoc_app:${{ format('ci-app-{0}-{1}', github.run_id, github.run_attempt) }}@localhost:5432/aisoc_invitation_test
+      DATABASE_MIGRATION_URL: postgresql+asyncpg://aisoc:${{ format('ci-owner-{0}-{1}', github.run_id, github.run_attempt) }}@localhost:5432/aisoc_invitation_test
+      AISOC_APP_DB_PASSWORD: ${{ format('ci-app-{0}-{1}', github.run_id, github.run_attempt) }}
+      AISOC_MIGRATIONS_STRICT: '1'
+      SECRET_KEY: ci-dummy-secret-key-at-least-32bytes!
+      ENVIRONMENT: development
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install API development dependencies from poetry.lock
+        run: |
+          set -euo pipefail
+          SYSTEM="$(python3 scripts/service_requirements.py api --system)"
+          if [ -n "${SYSTEM}" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends ${SYSTEM}
+          fi
+          python3 -m venv "$RUNNER_TEMP/.venv-api-invitations"
+          python3 scripts/service_requirements.py api --locked > "$RUNNER_TEMP/api-invitations.lock.txt"
+          "$RUNNER_TEMP/.venv-api-invitations/bin/pip" install \
+            --quiet --disable-pip-version-check --no-deps \
+            -r "$RUNNER_TEMP/api-invitations.lock.txt"
+          "$RUNNER_TEMP/.venv-api-invitations/bin/python" -m pytest --version
+          "$RUNNER_TEMP/.venv-api-invitations/bin/ruff" --version
+
+      - name: Assert the disposable database is empty
+        working-directory: services/api
+        run: |
+          "$RUNNER_TEMP/.venv-api-invitations/bin/python" - <<'PY'
+          import asyncio
+          import os
+          import asyncpg
+
+          async def main():
+              conn = await asyncpg.connect(os.environ["DATABASE_MIGRATION_URL"])
+              try:
+                  migration_table = await conn.fetchval(
+                      "SELECT to_regclass('public.aisoc_schema_migrations')"
+                  )
+                  user_tables = await conn.fetchval(
+                      "SELECT count(*) FROM pg_tables "
+                      "WHERE schemaname = 'public' AND tablename NOT LIKE 'pg_%'"
+                  )
+                  if migration_table is not None or user_tables != 0:
+                      raise SystemExit("PostgreSQL service did not start with an empty database")
+                  print("empty disposable database verified")
+              finally:
+                  await conn.close()
+
+          asyncio.run(main())
+          PY
+
+      - name: Apply all pending migrations with the normal runner
+        working-directory: services/api
+        run: |
+          "$RUNNER_TEMP/.venv-api-invitations/bin/python" -m app.scripts.run_migrations
+
+      - name: Run focused invitation and provisioning unit suites
+        working-directory: services/api
+        run: >-
+          "$RUNNER_TEMP/.venv-api-invitations/bin/python" -m pytest
+          tests/test_tenant_admin_invitations.py
+          tests/test_tenant_provision.py
+          -q
+
+      - name: Run real PostgreSQL concurrent-redemption integration test
+        working-directory: services/api
+        env:
+          AISOC_RUN_INTEGRATION: '1'
+        run: >-
+          "$RUNNER_TEMP/.venv-api-invitations/bin/python" -m pytest
+          tests/test_tenant_admin_invitations.py::test_postgres_concurrent_invitation_redemption_is_single_use
+          -q -m integration
+
+      - name: Run locked Ruff on changed backend files
+        working-directory: services/api
+        run: >-
+          "$RUNNER_TEMP/.venv-api-invitations/bin/ruff" check
+          app/api/v1/endpoints/auth.py
+          app/models/tenant_admin_invitation.py
+          app/services/tenant_provision/provisioner.py
+          tests/test_tenant_admin_invitations.py
+          tests/test_tenant_provision.py

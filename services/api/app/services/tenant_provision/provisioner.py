@@ -34,11 +34,8 @@ What "provisioning" does, end to end:
    target tenant already has connectors and bails out cheaply if so.
    The seed dataset uses the *demo* tenant id today; we extract the
    reusable helper rather than copy-pasting the seeded SQL.
-5. Mint an initial admin invite link (``/invite/{token}``). The token
-   is *not* validated against any DB table yet — the actual
-   ``invitations`` table is owned by the auth migrations and will land
-   in a follow-up. Today the invite URL is a signed pointer the
-   operator emails out manually.
+5. Mint an initial admin invite link (``/invite/{token}``) and persist
+   only its SHA-256 digest, tenant/user association, and expiry.
 6. Stamp ``contacted_at`` / ``onboarded_at`` / ``provisioned_tenant_id``
    on the waitlist entry and flip its status to ``onboarded``.
 
@@ -49,6 +46,7 @@ roll back if any downstream step (e.g. webhook fan-out) fails.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import secrets
@@ -59,11 +57,13 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from cryptography.fernet import Fernet
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import console_base_url
+from app.db.rls import set_rls_context
 from app.models.tenant import Tenant, User
+from app.models.tenant_admin_invitation import TenantAdminInvitation
 from app.models.waitlist import (
     WAITLIST_STATUS_ONBOARDED,
     WaitlistEntry,
@@ -110,13 +110,10 @@ class SlugCollisionError(ProvisioningError):
 
 @dataclass(frozen=True)
 class AdminInvite:
-    """A signed invite link minted for the initial tenant admin.
+    """A one-time invite link minted for the initial tenant admin.
 
-    The ``token`` is *not* a JWT; it's a URL-safe random string we
-    emit and ask the operator to email out manually. The invite
-    consumption flow / proper invitations table lands in a follow-up;
-    for now the value is opaque and surfaced verbatim to the support
-    team via the admin UI.
+    The raw token is returned only so the authorized operator can pass
+    the URL to the intended admin. Only its SHA-256 digest is stored.
     """
 
     token: str
@@ -267,6 +264,41 @@ def _build_admin_invite(
     return AdminInvite(token=token, expires_at=expires_at, url=url)
 
 
+async def _persist_admin_invite(
+    db: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    tenant_slug: str,
+    invite_base_url: str,
+) -> AdminInvite:
+    """Revoke any outstanding invite and persist a digest for a fresh one."""
+    await set_rls_context(db, tenant_id)
+    invite = _build_admin_invite(tenant_slug=tenant_slug, invite_base_url=invite_base_url)
+    now = datetime.now(UTC)
+    await db.execute(
+        update(TenantAdminInvitation)
+        .where(
+            TenantAdminInvitation.tenant_id == tenant_id,
+            TenantAdminInvitation.user_id == user_id,
+            TenantAdminInvitation.consumed_at.is_(None),
+            TenantAdminInvitation.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+    db.add(
+        TenantAdminInvitation(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            token_hash=hashlib.sha256(invite.token.encode("utf-8")).hexdigest(),
+            created_at=now,
+            expires_at=invite.expires_at,
+        )
+    )
+    await db.flush()
+    return invite
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -383,6 +415,7 @@ async def provision_from_waitlist(
         slug=slug,
         plan="managed-beta",
         is_active=True,
+        mssp_role="standalone",
         settings=tenant_settings,
         limits=tenant_limits,
     )
@@ -430,7 +463,13 @@ async def provision_from_waitlist(
                 exc,
             )
 
-    invite = _build_admin_invite(tenant_slug=tenant.slug, invite_base_url=invite_base_url)
+    invite = await _persist_admin_invite(
+        db,
+        tenant_id=tenant.id,
+        user_id=admin_user.id,
+        tenant_slug=tenant.slug,
+        invite_base_url=invite_base_url,
+    )
 
     # Patch the waitlist row last so the entry's stamped timestamps
     # only flip after every dependent write has succeeded.
@@ -537,9 +576,19 @@ async def _result_for_existing(
         .scalars()
         .first()
     )
-    admin_email = admin_row.email if admin_row else entry.email
-    admin_role = admin_row.role if admin_row else "tenant_admin"
-    admin_id = admin_row.id if admin_row else uuid.uuid4()
+    if (
+        admin_row is None
+        or admin_row.tenant_id != tenant.id
+        or admin_row.role != "tenant_admin"
+        or admin_row.is_active
+        or admin_row.is_verified
+        or admin_row.hashed_password != "!invite-pending"
+    ):
+        raise WaitlistEntryNotPromotableError(f"waitlist entry {entry.id} no longer has a pending initial admin")
+
+    admin_email = admin_row.email
+    admin_role = admin_row.role
+    admin_id = admin_row.id
     fingerprint = (tenant.settings or {}).get("aisoc_credential_key_fingerprint", "") or ""
 
     return ProvisionResult(
@@ -547,7 +596,13 @@ async def _result_for_existing(
         tenant_slug=tenant.slug,
         tenant_name=tenant.name,
         waitlist_entry_id=entry.id,
-        admin_invite=_build_admin_invite(tenant_slug=tenant.slug, invite_base_url=invite_base_url),
+        admin_invite=await _persist_admin_invite(
+            db,
+            tenant_id=tenant.id,
+            user_id=admin_row.id,
+            tenant_slug=tenant.slug,
+            invite_base_url=invite_base_url,
+        ),
         admin_user=InitialAdminUser(id=admin_id, email=admin_email, role=admin_role),
         demo_seeded=False,
         aisoc_credential_key_fingerprint=fingerprint,
