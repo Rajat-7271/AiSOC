@@ -6,7 +6,9 @@ name: Tenant admin invitations
 on:
   pull_request:
   push:
-    branches: [main]
+    branches:
+      - main
+      - 'feature/tenant-admin-invitations'
   workflow_dispatch:
 
 permissions:
