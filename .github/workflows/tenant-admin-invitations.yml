@@ -77,7 +77,11 @@ jobs:
           import asyncpg
 
           async def main():
-              conn = await asyncpg.connect(os.environ["DATABASE_MIGRATION_URL"])
+              conn = await asyncpg.connect(
+                os.environ["DATABASE_MIGRATION_URL"].replace(
+                  "postgresql+asyncpg://", "postgresql://", 1
+                )
+              )
               try:
                   migration_table = await conn.fetchval(
                       "SELECT to_regclass('public.aisoc_schema_migrations')"
