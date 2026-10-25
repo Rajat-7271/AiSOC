@@ -32,6 +32,7 @@ class _Result:
         return self.value
 
 
+
 class _InvitationSession:
     """Small transactional stand-in that models conditional UPDATE claims."""
 
@@ -67,13 +68,22 @@ class _InvitationSession:
         self._claim_lock = asyncio.Lock()
         self.password_updates = 0
 
-    async def execute(self, stmt: Any) -> _Result:
+    async def execute(self, stmt: Any, *args: Any, **kwargs: Any) -> _Result:
         sql = str(stmt).lower()
+
         if "set_config('app.current_tenant_id'" in sql:
             return _Result()
+
         if sql.startswith("select") and "tenant_admin_invitations" in sql:
             params = dict(stmt.compile().params)
-            requested_hash = next((value for value in params.values() if isinstance(value, str) and len(value) == 64), None)
+            requested_hash = next(
+                (
+                    value
+                    for value in params.values()
+                    if isinstance(value, str) and len(value) == 64
+                ),
+                None,
+            )
             invite = self.invitation
             valid = (
                 requested_hash == invite.token_hash
@@ -82,12 +92,40 @@ class _InvitationSession:
                 and invite.revoked_at is None
             )
             return _Result(invite if valid else None)
-        if sql.startswith("select") and " from tenants" in sql:
+
+        if sql.startswith("select") and "from tenants" in sql:
             params = dict(stmt.compile().params)
-            return _Result(self.tenant if self.tenant.slug in params.values() else None)
-        if sql.startswith("select") and " from users" in sql:
+            requested_id = next(
+                (
+                    value
+                    for value in params.values()
+                    if isinstance(value, uuid.UUID)
+                ),
+                None,
+            )
+            requested_slug = next(
+                (
+                    value
+                    for value in params.values()
+                    if isinstance(value, str)
+                    and value == self.tenant.slug
+                ),
+                None,
+            )
+            valid = (
+                requested_id == self.tenant.id
+                and requested_slug == self.tenant.slug
+                and self.tenant.is_active
+            )
+            return _Result(self.tenant if valid else None)
+
+        if sql.startswith("select") and "from users" in sql:
             params = dict(stmt.compile().params)
-            wanted = {v for v in params.values() if isinstance(v, uuid.UUID)}
+            wanted = {
+                value
+                for value in params.values()
+                if isinstance(value, uuid.UUID)
+            }
             valid = (
                 self.user.id in wanted
                 and self.user.tenant_id in wanted
@@ -97,6 +135,7 @@ class _InvitationSession:
                 and self.user.hashed_password == "!invite-pending"
             )
             return _Result(self.user if valid else None)
+
         if sql.startswith("update tenant_admin_invitations"):
             async with self._claim_lock:
                 invite = self.invitation
@@ -106,17 +145,27 @@ class _InvitationSession:
                     or invite.expires_at <= datetime.now(UTC)
                 ):
                     return _Result()
+
                 invite.consumed_at = datetime.now(UTC)
                 return _Result(invite.id)
+
         if sql.startswith("update users"):
             user = self.user
-            if user.is_active or user.is_verified or user.hashed_password != "!invite-pending":
+            if (
+                user.is_active
+                or user.is_verified
+                or user.hashed_password != "!invite-pending"
+            ):
                 return _Result()
+
             self.password_updates += 1
             for column, bind in stmt._values.items():
                 setattr(user, column.key, bind.value)
+
             return _Result(user.id)
+
         raise AssertionError(f"unexpected SQL in fake session: {sql}")
+
 
 
 class _AllowLimiter:
@@ -149,14 +198,16 @@ def _request(body: object) -> Request:
 
 @pytest.fixture(autouse=True)
 def _allow_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(auth, "get_signup_rate_limiter", lambda: _AllowLimiter())
+    monkeypatch.setattr(auth, "get_signup_rate_limiter",
+                        lambda: _AllowLimiter())
 
 
 @pytest.mark.asyncio
 async def test_validate_invitation_returns_only_boolean() -> None:
     db = _InvitationSession()
     response = await auth.validate_admin_invitation(
-        _request({"token": _RAW_TOKEN, "tenant": "sentinel-demo"}), db  # type: ignore[arg-type]
+        _request({"token": _RAW_TOKEN, "tenant": "sentinel-demo"}
+                 ), db  # type: ignore[arg-type]
     )
     assert response == {"valid": True}
     assert "email" not in response
@@ -178,7 +229,8 @@ async def test_invalid_wrong_tenant_and_expired_invites_are_generic(
 ) -> None:
     db = _InvitationSession(expiry=expiry)
     response = await auth.validate_admin_invitation(
-        _request({"token": token, "tenant": tenant}), db  # type: ignore[arg-type]
+        _request({"token": token, "tenant": tenant}
+                 ), db  # type: ignore[arg-type]
     )
     assert response == {"valid": False}
 
@@ -188,7 +240,8 @@ async def test_revoked_invitation_is_not_valid() -> None:
     db = _InvitationSession()
     db.invitation.revoked_at = datetime.now(UTC)
     response = await auth.validate_admin_invitation(
-        _request({"token": _RAW_TOKEN, "tenant": "sentinel-demo"}), db  # type: ignore[arg-type]
+        _request({"token": _RAW_TOKEN, "tenant": "sentinel-demo"}
+                 ), db  # type: ignore[arg-type]
     )
     assert response == {"valid": False}
 
@@ -197,7 +250,8 @@ async def test_revoked_invitation_is_not_valid() -> None:
 async def test_redemption_activates_only_the_invited_initial_admin() -> None:
     db = _InvitationSession()
     response = await auth.redeem_admin_invitation(
-        _request({"token": _RAW_TOKEN, "tenant": "sentinel-demo", "password": "valid-password-123"}),
+        _request({"token": _RAW_TOKEN, "tenant": "sentinel-demo",
+                 "password": "valid-password-123"}),
         db,  # type: ignore[arg-type]
     )
     assert response == {"ok": True}
@@ -216,7 +270,8 @@ async def test_redemption_refuses_short_password_without_echoing_input() -> None
     password = "short"
     with pytest.raises(HTTPException) as error:
         await auth.redeem_admin_invitation(
-            _request({"token": token, "tenant": "sentinel-demo", "password": password}),
+            _request({"token": token, "tenant": "sentinel-demo",
+                     "password": password}),
             _InvitationSession(),  # type: ignore[arg-type]
         )
     assert error.value.status_code == 400
@@ -229,7 +284,8 @@ async def test_invitation_cannot_activate_a_changed_user_identity() -> None:
     db = _InvitationSession()
     db.user.role = "soc_analyst"
     response = await auth.validate_admin_invitation(
-        _request({"token": _RAW_TOKEN, "tenant": "sentinel-demo"}), db  # type: ignore[arg-type]
+        _request({"token": _RAW_TOKEN, "tenant": "sentinel-demo"}
+                 ), db  # type: ignore[arg-type]
     )
     assert response == {"valid": False}
 
@@ -237,13 +293,15 @@ async def test_invitation_cannot_activate_a_changed_user_identity() -> None:
 @pytest.mark.asyncio
 async def test_replay_is_rejected_and_does_not_change_password_again() -> None:
     db = _InvitationSession()
-    request = lambda: _request(
-        {"token": _RAW_TOKEN, "tenant": "sentinel-demo", "password": "valid-password-123"}
+    def request(): return _request(
+        {"token": _RAW_TOKEN, "tenant": "sentinel-demo",
+            "password": "valid-password-123"}
     )
     await auth.redeem_admin_invitation(request(), db)  # type: ignore[arg-type]
     saved_hash = db.user.hashed_password
     with pytest.raises(HTTPException) as error:
-        await auth.redeem_admin_invitation(request(), db)  # type: ignore[arg-type]
+        # type: ignore[arg-type]
+        await auth.redeem_admin_invitation(request(), db)
     assert error.value.status_code == 400
     assert error.value.detail == auth._INVITATION_ERROR
     assert db.user.hashed_password == saved_hash
@@ -253,10 +311,13 @@ async def test_replay_is_rejected_and_does_not_change_password_again() -> None:
 @pytest.mark.asyncio
 async def test_concurrent_redemptions_allow_exactly_one_claim() -> None:
     db = _InvitationSession()
-    body = {"token": _RAW_TOKEN, "tenant": "sentinel-demo", "password": "valid-password-123"}
+    body = {"token": _RAW_TOKEN, "tenant": "sentinel-demo",
+        "password": "valid-password-123"}
     outcomes = await asyncio.gather(
-        auth.redeem_admin_invitation(_request(body), db),  # type: ignore[arg-type]
-        auth.redeem_admin_invitation(_request(body), db),  # type: ignore[arg-type]
+        auth.redeem_admin_invitation(
+            _request(body), db),  # type: ignore[arg-type]
+        auth.redeem_admin_invitation(
+            _request(body), db),  # type: ignore[arg-type]
         return_exceptions=True,
     )
     assert sum(result == {"ok": True} for result in outcomes) == 1
@@ -268,7 +329,8 @@ async def test_concurrent_redemptions_allow_exactly_one_claim() -> None:
 def test_postgres_concurrent_invitation_redemption_is_single_use() -> None:
     """Exercise the conditional claim against PostgreSQL, not the fake above."""
     if not os.getenv("AISOC_RUN_INTEGRATION"):
-        pytest.skip("set AISOC_RUN_INTEGRATION=1 to run invitation redemption against PostgreSQL")
+        pytest.skip(
+            "set AISOC_RUN_INTEGRATION=1 to run invitation redemption against PostgreSQL")
 
     from app.db.database import AsyncSessionLocal
 
@@ -325,7 +387,8 @@ def test_postgres_concurrent_invitation_redemption_is_single_use() -> None:
                 async with AsyncSessionLocal() as session:
                     try:
                         result = await auth.redeem_admin_invitation(
-                            _request({"token": token, "tenant": slug, "password": password}),
+                            _request({"token": token, "tenant": slug,
+                                     "password": password}),
                             session,  # type: ignore[arg-type]
                         )
                         await session.commit()
@@ -336,7 +399,8 @@ def test_postgres_concurrent_invitation_redemption_is_single_use() -> None:
 
             outcomes = await asyncio.gather(redeem_once(), redeem_once())
             assert sum(result == {"ok": True} for result in outcomes) == 1
-            assert sum(isinstance(result, HTTPException) for result in outcomes) == 1
+            assert sum(isinstance(result, HTTPException)
+                       for result in outcomes) == 1
 
             async with AsyncSessionLocal() as session:
                 user = await session.get(User, user_id)
@@ -349,7 +413,8 @@ def test_postgres_concurrent_invitation_redemption_is_single_use() -> None:
         finally:
             async with AsyncSessionLocal() as cleanup:
                 await cleanup.execute(
-                    delete(TenantAdminInvitation).where(TenantAdminInvitation.id == invite_id)
+                    delete(TenantAdminInvitation).where(
+                        TenantAdminInvitation.id == invite_id)
                 )
                 await cleanup.execute(delete(User).where(User.id == user_id))
                 await cleanup.execute(delete(Tenant).where(Tenant.id == tenant_id))
